@@ -100,14 +100,15 @@ def parse_args_run(parser: ap.ArgumentParser):
         "--ceiling",
         action="store_true",
         help="Additionally compute a data ceiling: a real-data-only upper bound on "
-        "each metric, estimated by bootstrapping the real data against itself. "
-        "Writes ceiling_results.csv / agg_ceiling_results.csv alongside the normal results.",
+        "each metric, estimated by splitting the real data into two disjoint halves "
+        "at several depths and extrapolating each metric's depth curve to full depth. "
+        "Writes ceiling_results.csv alongside the normal results.",
     )
     parser.add_argument(
         "--ceiling-seed",
         type=int,
         default=0,
-        help="Random seed for the data ceiling bootstrap [default: %(default)s]",
+        help="Random seed for the data ceiling disjoint split [default: %(default)s]",
     )
     parser.add_argument(
         "--cpm-filter",

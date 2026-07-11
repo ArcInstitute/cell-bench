@@ -405,32 +405,6 @@ def _assert_results_close(a, b) -> None:
     assert np.allclose(num_a, num_b, equal_nan=True)
 
 
-def test_ceiling_bootstrap_halves_membership():
-    """Each half must carry every perturbation + control with the real counts."""
-    adata_real = build_random_anndata()
-    evaluator = MetricsEvaluator(
-        adata_pred=adata_real.copy(),
-        adata_real=adata_real,
-        control_pert=CONTROL_VAR,
-        pert_col=PERT_COL,
-        outdir=OUTDIR,
-        skip_de=True,  # membership only depends on the bootstrap, skip pdex
-    )
-
-    half_real, half_pred = evaluator._bootstrap_halves(seed=0)
-
-    real_counts = evaluator.anndata_pair.real.obs[PERT_COL].value_counts().to_dict()
-    assert CONTROL_VAR in real_counts
-    for half in (half_real, half_pred):
-        half_counts = half.obs[PERT_COL].value_counts().to_dict()
-        # same set of perturbations (incl. control) and same per-pert membership
-        assert half_counts == real_counts
-        # sampling with replacement must yield unique obs names
-        assert half.obs_names.is_unique
-
-    shutil.rmtree(OUTDIR)
-
-
 def test_eval_ceiling():
     adata_real = build_random_anndata()
     adata_pred = adata_real.copy()
@@ -441,11 +415,11 @@ def test_eval_ceiling():
         pert_col=PERT_COL,
         outdir=OUTDIR,
     )
-    results, agg_results = evaluator.compute_ceiling(break_on_error=True)
-    assert results.height > 0
-    assert agg_results.height > 0
+    table = evaluator.compute_ceiling(break_on_error=True)
+    assert table.height > 0
+    for col in ("metric", "extrap"):
+        assert col in table.columns
     assert os.path.exists(f"{OUTDIR}/ceiling_results.csv")
-    assert os.path.exists(f"{OUTDIR}/agg_ceiling_results.csv")
     shutil.rmtree(OUTDIR)
 
 
@@ -462,7 +436,6 @@ def test_eval_ceiling_prefix():
     )
     evaluator.compute_ceiling(break_on_error=True)
     assert os.path.exists(f"{OUTDIR}/arbitrary_ceiling_results.csv")
-    assert os.path.exists(f"{OUTDIR}/arbitrary_agg_ceiling_results.csv")
     shutil.rmtree(OUTDIR)
 
 
@@ -479,6 +452,7 @@ def test_eval_ceiling_profiles():
     for profile in KNOWN_PROFILES:
         evaluator.compute_ceiling(
             profile=profile,
+            fracs=(1.0, 0.5),
             break_on_error=True,
             write_csv=False,
         )
@@ -498,12 +472,13 @@ def test_eval_ceiling_pds_skips_de():
         skip_de=True,
     )
     assert evaluator.de_comparison is None
-    results, _ = evaluator.compute_ceiling(
+    table = evaluator.compute_ceiling(
         profile="pds",
+        fracs=(1.0, 0.5),
         break_on_error=True,
         write_csv=False,
     )
-    assert results.height > 0
+    assert table.height > 0
     shutil.rmtree(OUTDIR)
 
 
@@ -518,9 +493,19 @@ def test_eval_ceiling_reproducible():
         outdir=OUTDIR,
         num_threads=1,  # deterministic reductions
     )
-    r1, _ = evaluator.compute_ceiling(seed=7, write_csv=False, break_on_error=True)
-    r2, _ = evaluator.compute_ceiling(seed=7, write_csv=False, break_on_error=True)
-    _assert_results_close(r1, r2)
+    r1 = evaluator.compute_ceiling(
+        seed=7, fracs=(1.0, 0.5), write_csv=False, break_on_error=True
+    ).sort("metric")
+    r2 = evaluator.compute_ceiling(
+        seed=7, fracs=(1.0, 0.5), write_csv=False, break_on_error=True
+    ).sort("metric")
+    assert r1["metric"].to_list() == r2["metric"].to_list()
+    for col in ("extrap", "extrap_linear"):
+        assert np.allclose(
+            np.array(r1[col].to_list(), dtype=float),
+            np.array(r2[col].to_list(), dtype=float),
+            equal_nan=True,
+        )
     shutil.rmtree(OUTDIR)
 
 
@@ -544,16 +529,15 @@ def test_eval_ceiling_does_not_clobber_de():
     with open(pred_de_path, "rb") as fh:
         before_pred = fh.read()
 
-    evaluator.compute_ceiling(seed=0, break_on_error=True)
+    evaluator.compute_ceiling(seed=0, fracs=(1.0, 0.5), break_on_error=True)
 
     with open(real_de_path, "rb") as fh:
         assert fh.read() == before_real
     with open(pred_de_path, "rb") as fh:
         assert fh.read() == before_pred
 
-    # ceiling outputs exist, but no ceiling DE artifacts are written
+    # ceiling output exists, but no ceiling DE artifacts are written
     assert os.path.exists(f"{OUTDIR}/ceiling_results.csv")
-    assert os.path.exists(f"{OUTDIR}/agg_ceiling_results.csv")
     assert not os.path.exists(f"{OUTDIR}/ceiling_real_de.csv")
     assert not os.path.exists(f"{OUTDIR}/ceiling_pred_de.csv")
     shutil.rmtree(OUTDIR)
