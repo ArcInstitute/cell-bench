@@ -226,7 +226,7 @@ def strip_anndata(
 
         # Write the h5ad file
         logger.info(f"Writing h5ad output to {tmp_h5ad}")
-        minimal.write_h5ad(tmp_h5ad)  # ty: ignore[invalid-argument-type]
+        minimal.write_h5ad(tmp_h5ad)
 
         # Zstd compress the h5ad file (will create pred.h5ad.zst)
         logger.info(f"Zstd compressing {tmp_h5ad}")
