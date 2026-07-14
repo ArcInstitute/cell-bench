@@ -77,7 +77,7 @@ def build_base_mean_adata(
 
     if output_path is not None:
         logger.info(f"Saving baseline data to {output_path}")
-        baseline_adata.write_h5ad(output_path)  # ty: ignore[invalid-argument-type]
+        baseline_adata.write_h5ad(output_path)
 
     if output_de_path is not None:
         logger.info("Calculating differential expression")

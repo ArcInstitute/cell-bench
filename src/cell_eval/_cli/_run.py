@@ -2,6 +2,7 @@ import argparse as ap
 import importlib.metadata
 import logging
 import os
+from typing import Any
 
 from .. import KNOWN_PROFILES
 from ._const import DEFAULT_CTRL, DEFAULT_OUTDIR, DEFAULT_PERT_COL
@@ -119,6 +120,14 @@ def parse_args_run(parser: ap.ArgumentParser):
         "behavior unchanged); pass e.g. 5 to enable (T is dataset-dependent).",
     )
     parser.add_argument(
+        "--epsilon",
+        type=float,
+        default=0.0,
+        help="Epsilon (pseudocount) forwarded to pdex for the log fold-change "
+        "denominator [default: %(default)s]. Pass e.g. 1e-9 to match pdex>=0.2.5 "
+        "behavior.",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version="%(prog)s {version}".format(
@@ -154,6 +163,12 @@ def run_evaluation(args: ap.Namespace):
 
     skip_metrics = args.skip_metrics.split(",") if args.skip_metrics else None
 
+    # DE knobs forwarded to pdex (cpm_filter off by default; epsilon default 0.0).
+    pdex_kwargs: dict[str, Any] = {
+        "cpm_filter": args.cpm_filter,
+        "epsilon": args.epsilon,
+    }
+
     if args.celltype_col is not None:
         real = ad.read_h5ad(args.adata_real)
         pred = ad.read_h5ad(args.adata_pred)
@@ -181,7 +196,7 @@ def run_evaluation(args: ap.Namespace):
                 allow_discrete=args.allow_discrete,
                 prefix=ct,
                 skip_de=args.profile == "pds",
-                pdex_kwargs={"cpm_filter": args.cpm_filter},
+                pdex_kwargs=pdex_kwargs,
             )
             evaluator.compute(
                 profile=args.profile,
@@ -210,7 +225,7 @@ def run_evaluation(args: ap.Namespace):
             outdir=args.outdir,
             allow_discrete=args.allow_discrete,
             skip_de=args.profile == "pds",
-            pdex_kwargs={"cpm_filter": args.cpm_filter},
+            pdex_kwargs=pdex_kwargs,
         )
         evaluator.compute(
             profile=args.profile,
