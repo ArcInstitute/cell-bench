@@ -101,8 +101,9 @@ def parse_args_run(parser: ap.ArgumentParser):
         action="store_true",
         help="Additionally compute a data ceiling: a real-data-only upper bound on "
         "each metric, estimated by splitting the real data into two disjoint halves "
-        "at several depths and extrapolating each metric's depth curve to full depth. "
-        "Writes ceiling_results.csv alongside the normal results.",
+        "of n/2 cells and applying the Spearman-Brown correction (2r/(1+r)) to map "
+        "each reliability metric back to full depth. Writes ceiling_results.csv / "
+        "agg_ceiling_results.csv alongside the normal results.",
     )
     parser.add_argument(
         "--ceiling-seed",

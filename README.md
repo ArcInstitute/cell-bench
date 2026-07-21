@@ -84,21 +84,23 @@ This will give you metric evaluations for each perturbation individually (`resul
 #### Data ceiling
 
 To estimate the *maximum* achievable score on each metric given the noise inherent in the real
-data, pass `--ceiling`. This is computed from the **real data only**: the data is split into two
-*disjoint* halves (no cell in both) at several depths, the full metric suite is run on each
-self-split, and every metric's value-vs-depth curve is extrapolated to full depth. The result is,
-per metric, an unbiased upper bound on how well any model could score on this dataset.
-
-For reliability-like (correlation) metrics this extrapolation reduces to the analytical Spearman-Brown
-correction (`2r/(1+r)`), verified on real data where `extrap` matches Spearman-Brown on the
-correlation metrics; it generalizes the same idea to metrics that have no closed form.
+data, pass `--ceiling`. This is computed from the **real data only**: each perturbation's cells
+(and the control's) are split into two *disjoint* halves of `n/2` cells (no cell in both), one half
+plays "real" and the other "prediction", and the full metric suite is run on that self-split. Each
+reliability metric is then mapped from half depth back to full depth by the analytical
+Spearman-Brown correction `r' = 2r/(1+r)`. The result is, per metric, an unbiased upper bound on how
+well any model could score on this dataset.
 
 A disjoint split is used rather than a bootstrap self-split: a bootstrap draws the two halves from
 the same cells, so they are not independent, which biases the ceiling in *both* directions (so it is
 not a reliable upper bound). The shared cells make the halves agree more than two independent
 samples would (inflating it), while the duplicate cells over-call the FDR-gated DE metrics and drag
 the recovery metrics (recall / overlap / AUC) down. The disjoint split is unbiased but shallow (each
-half ≤ `n/2`), which the depth extrapolation corrects.
+half `n/2`), which the Spearman-Brown doubling corrects.
+
+The correction is applied only to a fixed set of reliability metrics (the `SB_METRICS` list in
+`_evaluator.py`); every other metric — error metrics, unbounded counts, and reliability metrics
+left off that list (`clustering_agreement`, `pearson_edistance`) — is reported as `NaN`.
 
 ```bash
 cell-eval run \
@@ -110,11 +112,11 @@ cell-eval run \
 ```
 
 This is *additive*: it writes the normal `results.csv` / `agg_results.csv` **and**
-`ceiling_results.csv`, a per-metric table with the measured depth curve and the extrapolation
-to full depth (`extrap`). The split is reproducible via `--ceiling-seed` (default `0`). From python:
+`ceiling_results.csv` / `agg_ceiling_results.csv`. The split is reproducible via `--ceiling-seed`
+(default `0`). From python, call `compute_ceiling` on the evaluator:
 
 ```python
-ceiling = evaluator.compute_ceiling(seed=0)
+ceiling, ceiling_agg = evaluator.compute_ceiling(seed=0)
 ```
 
 ### Score
