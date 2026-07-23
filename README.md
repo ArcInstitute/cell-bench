@@ -86,10 +86,10 @@ This will give you metric evaluations for each perturbation individually (`resul
 To estimate the *maximum* achievable score on each metric given the noise inherent in the real
 data, pass `--ceiling`. This is computed from the **real data only**: each perturbation's cells
 (and the control's) are split into two *disjoint* halves of `n/2` cells (no cell in both), one half
-plays "real" and the other "prediction", and the full metric suite is run on that self-split. Each
-reliability metric is then mapped from half depth back to full depth by the analytical
-Spearman-Brown correction `r' = 2r/(1+r)`. The result is, per metric, an unbiased upper bound on how
-well any model could score on this dataset.
+plays "real" and the other "prediction", and the full metric suite is run on that self-split.
+Averaging each metric over perturbations and applying the analytical Spearman-Brown correction
+`r' = 2r/(1+r)` maps that per-context mean from half depth back to full depth. The result is, per
+metric, an unbiased upper bound on how well any model could score on this dataset.
 
 A disjoint split is used rather than a bootstrap self-split: a bootstrap draws the two halves from
 the same cells, so they are not independent, which biases the ceiling in *both* directions (so it is
@@ -112,8 +112,9 @@ cell-eval run \
 ```
 
 This is *additive*: it writes the normal `results.csv` / `agg_results.csv` **and**
-`ceiling_results.csv` / `agg_ceiling_results.csv`. The split is reproducible via `--ceiling-seed`
-(default `0`). From python, call `compute_ceiling` on the evaluator:
+`ceiling_results.csv` (the raw per-perturbation self-split) / `agg_ceiling_results.csv` (the
+SB-corrected per-metric ceiling). The split is reproducible via `--ceiling-seed` (default `0`). From
+python, call `compute_ceiling` on the evaluator:
 
 ```python
 ceiling, ceiling_agg = evaluator.compute_ceiling(seed=0)

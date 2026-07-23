@@ -418,10 +418,11 @@ def test_eval_ceiling():
     results, agg = evaluator.compute_ceiling(break_on_error=True)
     assert results.height > 0
     assert "perturbation" in results.columns
-    # a reliability metric is SB-corrected; the doubling can never exceed 1
-    assert "pearson_delta" in results.columns
-    pv = results["pearson_delta"].drop_nulls().to_numpy()
-    assert np.all(pv <= 1.0 + 1e-9)
+    # the ceiling (SB of the per-context mean) lives in the aggregate and, being a
+    # doubling of a reliability, can never exceed 1
+    assert "pearson_delta" in agg.columns
+    cv = agg["pearson_delta"].drop_nulls().to_numpy()
+    assert np.all(cv <= 1.0 + 1e-9)
     assert os.path.exists(f"{OUTDIR}/ceiling_results.csv")
     assert os.path.exists(f"{OUTDIR}/agg_ceiling_results.csv")
     shutil.rmtree(OUTDIR)

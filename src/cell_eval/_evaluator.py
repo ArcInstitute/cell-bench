@@ -198,10 +198,11 @@ class MetricsEvaluator:
         Uses the real data only. Each perturbation's cells (and the control's) are
         split into two *disjoint* halves of ``n/2`` cells - no cell in both - and
         one half is treated as "real", the other as "prediction". Running the
-        normal metric pipeline on that self-split measures each metric's
-        reliability at half depth; the Spearman-Brown correction ``r' = 2r/(1+r)``
-        then maps it to full depth (``n``), an unbiased upper bound on how well any
-        model could score given the noise inherent in the real data.
+        normal metric pipeline on that self-split measures each metric per
+        perturbation at half depth; averaging over perturbations and applying the
+        Spearman-Brown correction ``r' = 2r/(1+r)`` maps that per-context mean to
+        full depth (``n``), an unbiased upper bound on how well any model could
+        score given the noise inherent in the real data.
 
         A *disjoint* split is used (rather than a bootstrap self-split) because a
         bootstrap draws both halves from the same cells, so they are not
@@ -215,11 +216,12 @@ class MetricsEvaluator:
         module-level ``SB_METRICS`` set (bounded, higher-is-better, and empirically
         well-behaved under doubling). Every other metric - error metrics, unbounded
         counts, and reliability metrics left off that list (``clustering_agreement``,
-        ``pearson_edistance``) - is emitted as ``NaN`` (no defensible ceiling). Outputs
-        mirror :meth:`compute` (``ceiling_results.csv`` /
-        ``agg_ceiling_results.csv``); the self-split DE is computed in-memory and
-        never written. The same ``pdex_kwargs`` and ``allow_discrete`` as the main
-        evaluation are reused so the ceiling is directly comparable.
+        ``pearson_edistance``) - is emitted as ``NaN`` (no defensible ceiling).
+        ``ceiling_results.csv`` holds the raw per-perturbation self-split scores;
+        ``agg_ceiling_results.csv`` holds the SB-corrected per-metric ceiling. The
+        self-split DE is computed in-memory and never written. The same
+        ``pdex_kwargs`` and ``allow_discrete`` as the main evaluation are reused so
+        the ceiling is directly comparable.
         """
         logger.info(f"Computing data ceiling (seed={seed})")
         half_real, half_pred = self._disjoint_halves(seed)
@@ -254,9 +256,11 @@ class MetricsEvaluator:
         pipeline.compute_de_metrics(ceiling_de)
         pipeline.compute_anndata_metrics(ceiling_pair)
 
-        # Half-depth self-split scores -> full-depth ceiling via Spearman-Brown.
-        results = _spearman_brown_correct(pipeline.get_results())
-        agg_results = results.drop("perturbation").describe()
+        # Spearman-Brown ceiling on the per-context AGGREGATE: average each metric
+        # over perturbations, then map that mean from half depth to full depth with
+        # r' = 2r/(1+r). results keeps the raw per-perturbation self-split scores.
+        results = pipeline.get_results()
+        agg_results = _spearman_brown_correct(results.drop("perturbation").mean())
 
         if write_csv:
             self._write_results(results, agg_results, basename)

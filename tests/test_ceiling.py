@@ -81,8 +81,9 @@ def test_disjoint_halves_share_no_cells():
 
 
 def test_compute_ceiling_end_to_end():
-    """compute_ceiling returns (results, agg): reliability metrics are SB-corrected
-    and bounded in [0, 1]; error metrics come back as NaN."""
+    """compute_ceiling returns (results, agg): `results` is the raw per-perturbation
+    self-split; `agg` is the SB-corrected per-context ceiling (one row) - reliability
+    metrics bounded in [0, 1], error / excluded metrics NaN."""
     adata_real = build_random_anndata()
     evaluator = MetricsEvaluator(
         adata_pred=adata_real.copy(),
@@ -95,19 +96,18 @@ def test_compute_ceiling_end_to_end():
     results, agg = evaluator.compute_ceiling(
         profile="anndata", write_csv=False, break_on_error=True
     )
+    # per-perturbation self-split measurements
     assert results.height > 0
     assert "perturbation" in results.columns
 
-    assert "pearson_delta" in results.columns
-    pv = results["pearson_delta"].drop_nulls().to_numpy()
-    assert np.all(pv <= 1.0 + 1e-9)  # SB doubling can never exceed 1
+    # the ceiling is the SB-corrected aggregate (mean over perturbations) - one row
+    assert agg.height == 1
+    assert "pearson_delta" in agg.columns
+    cv = agg["pearson_delta"].to_numpy()
+    assert np.all(cv <= 1.0 + 1e-9)  # SB doubling can never exceed 1
 
-    # error metrics are emitted as NaN (no defensible SB ceiling)
-    for col in ("mse", "mae"):
-        if col in results.columns:
-            assert np.all(np.isnan(results[col].to_numpy()))
-    # excluded reliability metrics are NaN too
-    for col in ("clustering_agreement", "pearson_edistance"):
-        if col in results.columns:
-            assert np.all(np.isnan(results[col].to_numpy()))
+    # error metrics and excluded reliabilities have no ceiling -> NaN in the aggregate
+    for col in ("mse", "mae", "clustering_agreement", "pearson_edistance"):
+        if col in agg.columns:
+            assert np.all(np.isnan(agg[col].to_numpy()))
     shutil.rmtree(OUTDIR)
