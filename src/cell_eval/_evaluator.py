@@ -1,7 +1,6 @@
 import logging
 import multiprocessing as mp
 import os
-import warnings
 from typing import Any, Literal
 
 import anndata as ad
@@ -18,6 +17,38 @@ from ._types import PerturbationAnndataPair, initialize_de_comparison
 from .utils import _cast_float16_to_float32
 
 logger = logging.getLogger(__name__)
+
+# Metrics that receive the Spearman-Brown ceiling correction (r' = 2r/(1+r)):
+# the bounded, higher-is-better reliability metrics for which doubling the depth
+# is meaningful and empirically accurate. Every OTHER metric in the ceiling output
+# - error metrics, unbounded counts, and reliability metrics where the doubling is
+# not trustworthy (e.g. clustering_agreement, pearson_edistance) - is emitted as
+# NaN. Edit this set to change which metrics are corrected (names must match the
+# metric column names produced by the pipeline).
+SB_METRICS = frozenset(
+    {
+        "pearson_delta",
+        "discrimination_score_l1",
+        "discrimination_score_l2",
+        "discrimination_score_cosine",
+        "overlap_at_N",
+        "overlap_at_50",
+        "overlap_at_100",
+        "overlap_at_200",
+        "overlap_at_500",
+        "precision_at_N",
+        "precision_at_50",
+        "precision_at_100",
+        "precision_at_200",
+        "precision_at_500",
+        "de_spearman_sig",
+        "de_spearman_lfc_sig",
+        "de_direction_match",
+        "de_sig_genes_recall",
+        "pr_auc",
+        "roc_auc",
+    }
+)
 
 
 def _available_cpus() -> int:
@@ -164,20 +195,36 @@ class MetricsEvaluator:
     ) -> tuple[pl.DataFrame, pl.DataFrame]:
         """Estimate a data ceiling: the maximum achievable score per metric.
 
-        Uses the real data only. For each perturbation (and the control) the
-        cells are bootstrapped to twice their count and split into two equal
-        halves; one half is treated as "real" and the other as "prediction".
-        Running the normal metric pipeline on that self-split yields, per metric,
-        an upper bound on how well any model could score given the noise inherent
-        in the real data.
+        Uses the real data only. Each perturbation's cells (and the control's) are
+        split into two *disjoint* halves of ``n/2`` cells - no cell in both - and
+        one half is treated as "real", the other as "prediction". Running the
+        normal metric pipeline on that self-split measures each metric per
+        perturbation at half depth; averaging over perturbations and applying the
+        Spearman-Brown correction ``r' = 2r/(1+r)`` maps that per-context mean to
+        full depth (``n``), an unbiased upper bound on how well any model could
+        score given the noise inherent in the real data.
 
-        Outputs mirror :meth:`compute` (``ceiling_results.csv`` /
-        ``agg_ceiling_results.csv``). The bootstrap DE is computed in-memory and
-        not written to disk. The same ``pdex_kwargs`` and ``allow_discrete`` used
-        for the main evaluation are reused so the ceiling is directly comparable.
+        A *disjoint* split is used (rather than a bootstrap self-split) because a
+        bootstrap draws both halves from the same cells, so they are not
+        independent - which biases the ceiling in both directions: shared cells
+        make the halves over-agree (inflating it), while duplicate cells over-call
+        the FDR-gated DE metrics and drag the recovery metrics down. The cost of a
+        disjoint split is depth (each half is ``n/2``), which the Spearman-Brown
+        doubling corrects for.
+
+        The correction is applied only to the reliability metrics listed in the
+        module-level ``SB_METRICS`` set (bounded, higher-is-better, and empirically
+        well-behaved under doubling). Every other metric - error metrics, unbounded
+        counts, and reliability metrics left off that list (``clustering_agreement``,
+        ``pearson_edistance``) - is emitted as ``NaN`` (no defensible ceiling).
+        ``ceiling_results.csv`` holds the raw per-perturbation self-split scores;
+        ``agg_ceiling_results.csv`` holds the SB-corrected per-metric ceiling. The
+        self-split DE is computed in-memory and never written. The same
+        ``pdex_kwargs`` and ``allow_discrete`` as the main evaluation are reused so
+        the ceiling is directly comparable.
         """
         logger.info(f"Computing data ceiling (seed={seed})")
-        half_real, half_pred = self._bootstrap_halves(seed)
+        half_real, half_pred = self._disjoint_halves(seed)
 
         ceiling_pair = PerturbationAnndataPair(
             real=half_real,
@@ -194,7 +241,7 @@ class MetricsEvaluator:
                 anndata_pair=ceiling_pair,
                 num_threads=self._num_threads,
                 allow_discrete=self._allow_discrete,
-                outdir=None,  # keep the bootstrap DE in-memory; never persisted
+                outdir=None,  # keep the self-split DE in-memory; never persisted
                 prefix=None,
                 pdex_kwargs=dict(self._pdex_kwargs),
             )
@@ -208,51 +255,46 @@ class MetricsEvaluator:
             pipeline.skip_metrics(skip_metrics)
         pipeline.compute_de_metrics(ceiling_de)
         pipeline.compute_anndata_metrics(ceiling_pair)
+
+        # Spearman-Brown ceiling on the per-context AGGREGATE: average each metric
+        # over perturbations, then map that mean from half depth to full depth with
+        # r' = 2r/(1+r). results keeps the raw per-perturbation self-split scores.
         results = pipeline.get_results()
-        agg_results = pipeline.get_agg_results()
+        agg_results = _spearman_brown_correct(results.drop("perturbation").mean())
 
         if write_csv:
             self._write_results(results, agg_results, basename)
 
         return results, agg_results
 
-    def _bootstrap_halves(self, seed: int) -> tuple[ad.AnnData, ad.AnnData]:
-        """Build two same-size bootstrap halves of the real data.
+    def _disjoint_halves(self, seed: int) -> tuple[ad.AnnData, ad.AnnData]:
+        """Split the real data into two *disjoint* halves of ``n/2`` cells each.
 
-        Resampling is stratified per perturbation (including the control): each
-        group's ``n`` cells are drawn ``2n`` times with replacement and split
-        into two halves of ``n`` cells. This guarantees both halves carry every
-        perturbation plus the control with the same per-perturbation membership
-        as the real data, so the resulting ``PerturbationAnndataPair`` validates
-        and the bootstrap DE keeps the same statistical power.
+        Each perturbation's cells (including the control's) are shuffled and split
+        without replacement into two halves of ``floor(n/2)`` cells - so no cell
+        appears in both halves, giving the independence a bootstrap self-split
+        lacks. Perturbations with fewer than 2 cells cannot be split and are
+        dropped from both halves. The resulting half depth (``n/2``) is corrected
+        back to full depth by the Spearman-Brown doubling in
+        :meth:`compute_ceiling`.
         """
         real = self.anndata_pair.real
         pert_col = self.anndata_pair.pert_col
-
         rng = np.random.default_rng(seed)
 
-        # Group row positions per perturbation in a single pass (`observed=True`
-        # keeps only perturbations actually present). `.indices` yields positional
-        # indices, so they can index the AnnData directly.
-        half_real_idx: list[np.ndarray] = []
-        half_pred_idx: list[np.ndarray] = []
+        a_idx: list[np.ndarray] = []
+        b_idx: list[np.ndarray] = []
         for _pert, idx in real.obs.groupby(pert_col, observed=True).indices.items():
-            draws = rng.choice(idx, size=2 * idx.size, replace=True)
-            half_real_idx.append(draws[: idx.size])
-            half_pred_idx.append(draws[idx.size :])
+            perm = rng.permutation(np.asarray(idx))
+            h = perm.size // 2
+            if h < 1:
+                continue  # < 2 cells: cannot form two disjoint halves
+            a_idx.append(perm[:h])
+            b_idx.append(perm[h : 2 * h])
 
-        # Sampling with replacement duplicates obs names; anndata warns about the
-        # non-unique index on slice, so silence that one known-benign warning and
-        # make the names unique immediately afterwards.
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore", message="Observation names are not unique"
-            )
-            half_real = real[np.concatenate(half_real_idx)].copy()
-            half_pred = real[np.concatenate(half_pred_idx)].copy()
-        half_real.obs_names_make_unique()
-        half_pred.obs_names_make_unique()
-
+        # Disjoint split has no duplicate rows, so obs names stay unique.
+        half_real = real[np.concatenate(a_idx)].copy()
+        half_pred = real[np.concatenate(b_idx)].copy()
         return half_real, half_pred
 
     def _write_results(
@@ -279,6 +321,27 @@ class MetricsEvaluator:
 
         logger.info(f"Writing aggregate metrics to {agg_outpath}")
         agg_results.write_csv(agg_outpath)
+
+
+def _spearman_brown_correct(results: pl.DataFrame) -> pl.DataFrame:
+    """Map half-depth self-split scores to the full-depth ceiling.
+
+    Applies the Spearman-Brown prophecy ``r' = 2r/(1+r)`` - the reliability of a
+    test of doubled length - to the reliability metrics listed in ``SB_METRICS``.
+    Every other column (error metrics, unbounded counts, and reliability metrics
+    not in that set) is emitted as ``NaN``, since a Spearman-Brown ceiling has no
+    defensible meaning there.
+    """
+    nan = float("nan")
+    exprs: list[pl.Expr] = []
+    for col in results.columns:
+        if col == "perturbation":
+            continue
+        if col in SB_METRICS:
+            exprs.append((2.0 * pl.col(col) / (1.0 + pl.col(col))).alias(col))
+        else:
+            exprs.append(pl.lit(nan).alias(col))
+    return results.with_columns(exprs) if exprs else results
 
 
 def _build_anndata_pair(

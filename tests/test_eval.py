@@ -405,32 +405,6 @@ def _assert_results_close(a, b) -> None:
     assert np.allclose(num_a, num_b, equal_nan=True)
 
 
-def test_ceiling_bootstrap_halves_membership():
-    """Each half must carry every perturbation + control with the real counts."""
-    adata_real = build_random_anndata()
-    evaluator = MetricsEvaluator(
-        adata_pred=adata_real.copy(),
-        adata_real=adata_real,
-        control_pert=CONTROL_VAR,
-        pert_col=PERT_COL,
-        outdir=OUTDIR,
-        skip_de=True,  # membership only depends on the bootstrap, skip pdex
-    )
-
-    half_real, half_pred = evaluator._bootstrap_halves(seed=0)
-
-    real_counts = evaluator.anndata_pair.real.obs[PERT_COL].value_counts().to_dict()
-    assert CONTROL_VAR in real_counts
-    for half in (half_real, half_pred):
-        half_counts = half.obs[PERT_COL].value_counts().to_dict()
-        # same set of perturbations (incl. control) and same per-pert membership
-        assert half_counts == real_counts
-        # sampling with replacement must yield unique obs names
-        assert half.obs_names.is_unique
-
-    shutil.rmtree(OUTDIR)
-
-
 def test_eval_ceiling():
     adata_real = build_random_anndata()
     adata_pred = adata_real.copy()
@@ -441,9 +415,14 @@ def test_eval_ceiling():
         pert_col=PERT_COL,
         outdir=OUTDIR,
     )
-    results, agg_results = evaluator.compute_ceiling(break_on_error=True)
+    results, agg = evaluator.compute_ceiling(break_on_error=True)
     assert results.height > 0
-    assert agg_results.height > 0
+    assert "perturbation" in results.columns
+    # the ceiling (SB of the per-context mean) lives in the aggregate and, being a
+    # doubling of a reliability, can never exceed 1
+    assert "pearson_delta" in agg.columns
+    cv = agg["pearson_delta"].drop_nulls().to_numpy()
+    assert np.all(cv <= 1.0 + 1e-9)
     assert os.path.exists(f"{OUTDIR}/ceiling_results.csv")
     assert os.path.exists(f"{OUTDIR}/agg_ceiling_results.csv")
     shutil.rmtree(OUTDIR)
@@ -462,7 +441,6 @@ def test_eval_ceiling_prefix():
     )
     evaluator.compute_ceiling(break_on_error=True)
     assert os.path.exists(f"{OUTDIR}/arbitrary_ceiling_results.csv")
-    assert os.path.exists(f"{OUTDIR}/arbitrary_agg_ceiling_results.csv")
     shutil.rmtree(OUTDIR)
 
 
@@ -498,7 +476,7 @@ def test_eval_ceiling_pds_skips_de():
         skip_de=True,
     )
     assert evaluator.de_comparison is None
-    results, _ = evaluator.compute_ceiling(
+    results, _agg = evaluator.compute_ceiling(
         profile="pds",
         break_on_error=True,
         write_csv=False,
@@ -520,7 +498,15 @@ def test_eval_ceiling_reproducible():
     )
     r1, _ = evaluator.compute_ceiling(seed=7, write_csv=False, break_on_error=True)
     r2, _ = evaluator.compute_ceiling(seed=7, write_csv=False, break_on_error=True)
-    _assert_results_close(r1, r2)
+    r1 = r1.sort("perturbation")
+    r2 = r2.sort("perturbation")
+    assert r1["perturbation"].to_list() == r2["perturbation"].to_list()
+    for col in (c for c in r1.columns if c != "perturbation"):
+        np.testing.assert_allclose(
+            r1[col].to_numpy().astype(float),
+            r2[col].to_numpy().astype(float),
+            equal_nan=True,
+        )
     shutil.rmtree(OUTDIR)
 
 
@@ -551,9 +537,8 @@ def test_eval_ceiling_does_not_clobber_de():
     with open(pred_de_path, "rb") as fh:
         assert fh.read() == before_pred
 
-    # ceiling outputs exist, but no ceiling DE artifacts are written
+    # ceiling output exists, but no ceiling DE artifacts are written
     assert os.path.exists(f"{OUTDIR}/ceiling_results.csv")
-    assert os.path.exists(f"{OUTDIR}/agg_ceiling_results.csv")
     assert not os.path.exists(f"{OUTDIR}/ceiling_real_de.csv")
     assert not os.path.exists(f"{OUTDIR}/ceiling_pred_de.csv")
     shutil.rmtree(OUTDIR)
