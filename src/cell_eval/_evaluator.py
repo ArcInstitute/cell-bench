@@ -71,8 +71,10 @@ class MetricsEvaluator:
     Arguments
     =========
 
-    adata_pred: ad.AnnData | str
-        Predicted anndata object or path to anndata object.
+    adata_pred: ad.AnnData | str | None
+        Predicted anndata object or path to anndata object. May be ``None`` to run
+        in ceiling-only mode (the data ceiling is estimated from the real data
+        alone); in that case only :meth:`compute_ceiling` is available.
     adata_real: ad.AnnData | str
         Real anndata object or path to anndata object.
     de_pred: pl.DataFrame | str | None = None
@@ -100,7 +102,7 @@ class MetricsEvaluator:
 
     def __init__(
         self,
-        adata_pred: ad.AnnData | str,
+        adata_pred: ad.AnnData | str | None,
         adata_real: ad.AnnData | str,
         de_pred: pl.DataFrame | str | None = None,
         de_real: pl.DataFrame | str | None = None,
@@ -132,6 +134,12 @@ class MetricsEvaluator:
         self._skip_de = skip_de
         self._pdex_kwargs = pdex_kwargs or {}
 
+        # Ceiling-only mode: the data ceiling is estimated from the real data
+        # alone, so no prediction is required. When adata_pred is None we skip
+        # building the main de_comparison (compute() is unavailable) - only
+        # compute_ceiling() may be called.
+        self.ceiling_only = adata_pred is None
+
         self.anndata_pair = _build_anndata_pair(
             real=adata_real,
             pred=adata_pred,
@@ -140,7 +148,7 @@ class MetricsEvaluator:
             allow_discrete=allow_discrete,
         )
 
-        if skip_de:
+        if skip_de or self.ceiling_only:
             self.de_comparison = None
         else:
             self.de_comparison = _build_de_comparison(
@@ -166,6 +174,11 @@ class MetricsEvaluator:
         write_csv: bool = True,
         break_on_error: bool = False,
     ) -> tuple[pl.DataFrame, pl.DataFrame]:
+        if self.ceiling_only:
+            raise ValueError(
+                "compute() requires a prediction (adata_pred). This evaluator was "
+                "created without one (ceiling-only mode); call compute_ceiling() instead."
+            )
         pipeline = MetricPipeline(
             profile=profile,
             metric_configs=metric_configs,
@@ -346,7 +359,7 @@ def _spearman_brown_correct(results: pl.DataFrame) -> pl.DataFrame:
 
 def _build_anndata_pair(
     real: ad.AnnData | str,
-    pred: ad.AnnData | str,
+    pred: ad.AnnData | str | None,
     control_pert: str,
     pert_col: str,
     allow_discrete: bool = False,
@@ -360,11 +373,17 @@ def _build_anndata_pair(
 
     # Cast float16 to float32 since NUMBA (used by pdex) does not support float16
     _cast_float16_to_float32(real, which="real")
-    _cast_float16_to_float32(pred, which="pred")
 
     # Validate that the input is normalized and log-transformed
     _convert_to_normlog(real, which="real", allow_discrete=allow_discrete)
-    _convert_to_normlog(pred, which="pred", allow_discrete=allow_discrete)
+
+    # Ceiling-only mode: no prediction supplied. The data ceiling reads only
+    # `.real`, so mirror real into pred to satisfy the pair (it is never scored).
+    if pred is None:
+        pred = real
+    else:
+        _cast_float16_to_float32(pred, which="pred")
+        _convert_to_normlog(pred, which="pred", allow_discrete=allow_discrete)
 
     # Build the anndata pair
     return PerturbationAnndataPair(

@@ -18,8 +18,10 @@ def parse_args_run(parser: ap.ArgumentParser):
         "-ap",
         "--adata-pred",
         type=str,
-        help="Path to the predicted adata object to evaluate",
-        required=True,
+        help="Path to the predicted adata object to evaluate. Optional in "
+        "ceiling-only mode (omit together with --ceiling to compute just the "
+        "real-data ceiling without a prediction).",
+        required=False,
     )
     parser.add_argument(
         "-ar",
@@ -165,6 +167,14 @@ def run_evaluation(args: ap.Namespace):
 
     skip_metrics = args.skip_metrics.split(",") if args.skip_metrics else None
 
+    # Ceiling-only mode: no prediction supplied, so only the real-data ceiling
+    # can be computed. Requires --ceiling to make the intent explicit.
+    ceiling_only = args.adata_pred is None
+    if ceiling_only and not args.ceiling:
+        raise ValueError(
+            "--adata-pred is required unless --ceiling is passed (ceiling-only mode)."
+        )
+
     # DE knobs forwarded to pdex (cpm_filter off by default; epsilon default 0.0).
     pdex_kwargs: dict[str, Any] = {
         "cpm_filter": args.cpm_filter,
@@ -173,14 +183,16 @@ def run_evaluation(args: ap.Namespace):
 
     if args.celltype_col is not None:
         real = ad.read_h5ad(args.adata_real)
-        pred = ad.read_h5ad(args.adata_pred)
-
         real_split = split_anndata_on_celltype(real, args.celltype_col)
-        pred_split = split_anndata_on_celltype(pred, args.celltype_col)
 
-        assert len(real_split) == len(pred_split), (
-            f"Number of celltypes in real and pred anndata must match: {len(real_split)} != {len(pred_split)}"
-        )
+        if ceiling_only:
+            pred_split = {ct: None for ct in real_split}
+        else:
+            pred = ad.read_h5ad(args.adata_pred)
+            pred_split = split_anndata_on_celltype(pred, args.celltype_col)
+            assert len(real_split) == len(pred_split), (
+                f"Number of celltypes in real and pred anndata must match: {len(real_split)} != {len(pred_split)}"
+            )
 
         for ct in real_split.keys():
             real_ct = real_split[ct]
@@ -200,12 +212,13 @@ def run_evaluation(args: ap.Namespace):
                 skip_de=args.profile == "pds",
                 pdex_kwargs=pdex_kwargs,
             )
-            evaluator.compute(
-                profile=args.profile,
-                metric_configs=metric_kwargs,
-                skip_metrics=skip_metrics,
-                basename="results.csv",
-            )
+            if not ceiling_only:
+                evaluator.compute(
+                    profile=args.profile,
+                    metric_configs=metric_kwargs,
+                    skip_metrics=skip_metrics,
+                    basename="results.csv",
+                )
             if args.ceiling:
                 evaluator.compute_ceiling(
                     profile=args.profile,
@@ -229,12 +242,13 @@ def run_evaluation(args: ap.Namespace):
             skip_de=args.profile == "pds",
             pdex_kwargs=pdex_kwargs,
         )
-        evaluator.compute(
-            profile=args.profile,
-            metric_configs=metric_kwargs,
-            skip_metrics=skip_metrics,
-            basename="results.csv",
-        )
+        if not ceiling_only:
+            evaluator.compute(
+                profile=args.profile,
+                metric_configs=metric_kwargs,
+                skip_metrics=skip_metrics,
+                basename="results.csv",
+            )
         if args.ceiling:
             evaluator.compute_ceiling(
                 profile=args.profile,
