@@ -196,8 +196,8 @@ class MetricsEvaluator:
         """Estimate a data ceiling: the maximum achievable score per metric.
 
         Uses the real data only. Each perturbation's cells (and the control's) are
-        split into two *disjoint* halves of ``n/2`` cells - no cell in both - and
-        one half is treated as "real", the other as "prediction". Running the
+        split into two *disjoint* halves of ``floor(n/2)`` cells - no cell in both -
+        and one half is treated as "real", the other as "prediction". Running the
         normal metric pipeline on that self-split measures each metric per
         perturbation at half depth; averaging over perturbations and applying the
         Spearman-Brown correction ``r' = 2r/(1+r)`` maps that per-context mean to
@@ -214,14 +214,24 @@ class MetricsEvaluator:
 
         The correction is applied only to the reliability metrics listed in the
         module-level ``SB_METRICS`` set (bounded, higher-is-better, and empirically
-        well-behaved under doubling). Every other metric - error metrics, unbounded
-        counts, and reliability metrics left off that list (``clustering_agreement``,
-        ``pearson_edistance``) - is emitted as ``NaN`` (no defensible ceiling).
+        well-behaved under doubling), and only where the measured reliability is
+        ``r > 0`` - below that the correction is a pole rather than a correction, so
+        it is reported as ``NaN`` (see :func:`_spearman_brown_correct`). Every other
+        metric - error metrics, unbounded counts, and reliability metrics left off
+        that list (``clustering_agreement``, ``pearson_edistance``) - is emitted as
+        ``NaN`` (no defensible ceiling).
+
         ``ceiling_results.csv`` holds the raw per-perturbation self-split scores;
         ``agg_ceiling_results.csv`` holds the SB-corrected per-metric ceiling. The
         self-split DE is computed in-memory and never written. The same
         ``pdex_kwargs`` and ``allow_discrete`` as the main evaluation are reused so
         the ceiling is directly comparable.
+
+        Cost: the two halves are materialized as copies, so peak memory is roughly
+        ``2x`` the real matrix on top of the already-loaded pair, and the self-split
+        DE is computed for both halves - so a ceiling run roughly doubles the wall
+        time. A precomputed ``de_real``/``de_pred`` does not carry over to the
+        ceiling: the halves are new data and need their own DE.
         """
         logger.info(f"Computing data ceiling (seed={seed})")
         half_real, half_pred = self._disjoint_halves(seed)
@@ -268,15 +278,16 @@ class MetricsEvaluator:
         return results, agg_results
 
     def _disjoint_halves(self, seed: int) -> tuple[ad.AnnData, ad.AnnData]:
-        """Split the real data into two *disjoint* halves of ``n/2`` cells each.
+        """Split the real data into two *disjoint* halves of ``floor(n/2)`` cells each.
 
         Each perturbation's cells (including the control's) are shuffled and split
         without replacement into two halves of ``floor(n/2)`` cells - so no cell
         appears in both halves, giving the independence a bootstrap self-split
-        lacks. Perturbations with fewer than 2 cells cannot be split and are
-        dropped from both halves. The resulting half depth (``n/2``) is corrected
-        back to full depth by the Spearman-Brown doubling in
-        :meth:`compute_ceiling`.
+        lacks. When ``n`` is odd the one leftover cell is discarded (both halves
+        must be the same depth for the doubling to hold). Perturbations with fewer
+        than 2 cells cannot be split and are dropped from both halves. The
+        resulting half depth (``floor(n/2)``) is corrected back to full depth by the
+        Spearman-Brown doubling in :meth:`compute_ceiling`.
         """
         real = self.anndata_pair.real
         pert_col = self.anndata_pair.pert_col
@@ -284,17 +295,38 @@ class MetricsEvaluator:
 
         a_idx: list[np.ndarray] = []
         b_idx: list[np.ndarray] = []
+        dropped = 0
         for _pert, idx in real.obs.groupby(pert_col, observed=True).indices.items():
             perm = rng.permutation(np.asarray(idx))
             h = perm.size // 2
             if h < 1:
-                continue  # < 2 cells: cannot form two disjoint halves
+                dropped += 1  # < 2 cells: cannot form two disjoint halves
+                continue
             a_idx.append(perm[:h])
             b_idx.append(perm[h : 2 * h])
+
+        if not a_idx:
+            raise ValueError(
+                "no perturbation has >= 2 cells to split for the data ceiling"
+            )
+        if dropped:
+            logger.warning(
+                f"Ceiling: dropped {dropped} perturbation(s) with < 2 cells "
+                f"(cannot be split); the ceiling is averaged over the remaining "
+                f"{len(a_idx)} perturbation(s), a different set than the main "
+                f"evaluation's aggregate."
+            )
 
         # Disjoint split has no duplicate rows, so obs names stay unique.
         half_real = real[np.concatenate(a_idx)].copy()
         half_pred = real[np.concatenate(b_idx)].copy()
+
+        control = self.anndata_pair.control_pert
+        if control not in set(half_real.obs[pert_col].astype(str)):
+            raise ValueError(
+                f"control {control!r} has < 2 cells; cannot compute a "
+                f"disjoint-split data ceiling"
+            )
         return half_real, half_pred
 
     def _write_results(
@@ -331,6 +363,22 @@ def _spearman_brown_correct(results: pl.DataFrame) -> pl.DataFrame:
     Every other column (error metrics, unbounded counts, and reliability metrics
     not in that set) is emitted as ``NaN``, since a Spearman-Brown ceiling has no
     defensible meaning there.
+
+    The correction is applied only where the measured reliability is ``r > 0``.
+    ``2r/(1+r)`` is a reliability correction only on that side; at ``r <= 0`` it is
+    a pole, not a correction (``r = -0.9`` gives ``-18.0``, and ``r = -1`` divides
+    by zero - in polars a silent ``-inf`` rather than a raise). Three metrics in
+    ``SB_METRICS`` are sign-unbounded and can land there on a small or degenerate
+    context: ``pearson_delta``, ``de_spearman_sig`` and ``de_spearman_lfc_sig``. A
+    non-positive split-half reliability means the halves do not agree at all, i.e.
+    there is no defensible ceiling, so it is reported as ``NaN`` - never a negative
+    "ceiling" worse than any achievable score. Null means (a metric that produced
+    no value) fall through the same branch.
+
+    Note this threshold is 0 for every metric, including ``pr_auc`` / ``roc_auc``
+    whose chance baseline is 0.5 rather than 0; a below-chance AUC is still passed
+    through the correction. That is deliberate - a 0.5 floor would be a stricter
+    rule than the one the ceiling was empirically validated under.
     """
     nan = float("nan")
     exprs: list[pl.Expr] = []
@@ -338,7 +386,12 @@ def _spearman_brown_correct(results: pl.DataFrame) -> pl.DataFrame:
         if col == "perturbation":
             continue
         if col in SB_METRICS:
-            exprs.append((2.0 * pl.col(col) / (1.0 + pl.col(col))).alias(col))
+            exprs.append(
+                pl.when(pl.col(col) > 0.0)
+                .then(2.0 * pl.col(col) / (1.0 + pl.col(col)))
+                .otherwise(pl.lit(nan))
+                .alias(col)
+            )
         else:
             exprs.append(pl.lit(nan).alias(col))
     return results.with_columns(exprs) if exprs else results
