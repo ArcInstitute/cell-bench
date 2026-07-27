@@ -2,6 +2,7 @@ import argparse as ap
 import importlib.metadata
 import logging
 import os
+import sys
 from typing import Any
 
 from .. import KNOWN_PROFILES
@@ -18,8 +19,11 @@ def parse_args_run(parser: ap.ArgumentParser):
         "-ap",
         "--adata-pred",
         type=str,
-        help="Path to the predicted adata object to evaluate",
-        required=True,
+        help="Path to the predicted adata object to evaluate. Optional in "
+        "ceiling-only mode (omit when passing --ceiling to compute just the "
+        "real-data ceiling without a prediction). In that mode only the ceiling "
+        "outputs are written - no results.csv and no DE tables.",
+        required=False,
     )
     parser.add_argument(
         "-ar",
@@ -167,6 +171,19 @@ def run_evaluation(args: ap.Namespace):
 
     skip_metrics = args.skip_metrics.split(",") if args.skip_metrics else None
 
+    # Ceiling-only mode: no prediction supplied, so only the real-data ceiling
+    # can be computed. Requires --ceiling to make the intent explicit.
+    ceiling_only = args.adata_pred is None
+    if ceiling_only and not args.ceiling:
+        # Usage error, so exit like argparse would (message on stderr, status 2)
+        # rather than surfacing a traceback for a wrong invocation.
+        print(
+            "cell-eval run: error: --adata-pred is required unless --ceiling is "
+            "passed (ceiling-only mode)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     # DE knobs forwarded to pdex (cpm_filter off by default; epsilon default 0.0).
     pdex_kwargs: dict[str, Any] = {
         "cpm_filter": args.cpm_filter,
@@ -175,14 +192,16 @@ def run_evaluation(args: ap.Namespace):
 
     if args.celltype_col is not None:
         real = ad.read_h5ad(args.adata_real)
-        pred = ad.read_h5ad(args.adata_pred)
-
         real_split = split_anndata_on_celltype(real, args.celltype_col)
-        pred_split = split_anndata_on_celltype(pred, args.celltype_col)
 
-        assert len(real_split) == len(pred_split), (
-            f"Number of celltypes in real and pred anndata must match: {len(real_split)} != {len(pred_split)}"
-        )
+        if ceiling_only:
+            pred_split = {ct: None for ct in real_split}
+        else:
+            pred = ad.read_h5ad(args.adata_pred)
+            pred_split = split_anndata_on_celltype(pred, args.celltype_col)
+            assert len(real_split) == len(pred_split), (
+                f"Number of celltypes in real and pred anndata must match: {len(real_split)} != {len(pred_split)}"
+            )
 
         for ct in real_split.keys():
             real_ct = real_split[ct]
@@ -202,12 +221,13 @@ def run_evaluation(args: ap.Namespace):
                 skip_de=args.profile == "pds",
                 pdex_kwargs=pdex_kwargs,
             )
-            evaluator.compute(
-                profile=args.profile,
-                metric_configs=metric_kwargs,
-                skip_metrics=skip_metrics,
-                basename="results.csv",
-            )
+            if not ceiling_only:
+                evaluator.compute(
+                    profile=args.profile,
+                    metric_configs=metric_kwargs,
+                    skip_metrics=skip_metrics,
+                    basename="results.csv",
+                )
             if args.ceiling:
                 evaluator.compute_ceiling(
                     profile=args.profile,
@@ -231,12 +251,13 @@ def run_evaluation(args: ap.Namespace):
             skip_de=args.profile == "pds",
             pdex_kwargs=pdex_kwargs,
         )
-        evaluator.compute(
-            profile=args.profile,
-            metric_configs=metric_kwargs,
-            skip_metrics=skip_metrics,
-            basename="results.csv",
-        )
+        if not ceiling_only:
+            evaluator.compute(
+                profile=args.profile,
+                metric_configs=metric_kwargs,
+                skip_metrics=skip_metrics,
+                basename="results.csv",
+            )
         if args.ceiling:
             evaluator.compute_ceiling(
                 profile=args.profile,
