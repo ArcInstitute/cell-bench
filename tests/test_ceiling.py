@@ -12,8 +12,8 @@ OUTDIR = "TEST_OUTPUT_CEILING"
 
 
 def test_spearman_brown_doubling_on_reliability_metrics():
-    """SB doubling r' = 2r/(1+r) is applied to reliability (best_value == ONE)
-    metric columns."""
+    """SB doubling r' = 2r/(1+r) is applied to the reliability metrics named in the
+    explicit SB_METRICS list."""
     df = pl.DataFrame(
         {
             "perturbation": ["a", "b"],
@@ -56,6 +56,64 @@ def test_non_reliability_and_excluded_metrics_are_nan():
     assert "pearson_delta" in SB_METRICS
     assert "clustering_agreement" not in SB_METRICS
     assert "pearson_edistance" not in SB_METRICS
+
+
+def test_non_positive_reliability_is_nan():
+    """2r/(1+r) is a pole for r <= 0, not a correction: r = -0.9 gives -18.0 and
+    r = -1 divides by zero (a silent -inf in polars). A non-positive split-half
+    reliability means the halves do not agree, so there is no defensible ceiling
+    -> NaN, and never a negative "ceiling" or an inf."""
+    df = pl.DataFrame(
+        {
+            "perturbation": ["a", "b", "c", "d", "e"],
+            # r = -1 would divide by zero; -0.9 -> -18.0; -0.5 -> -2.0;
+            # 0.0 is the boundary (the guard is > 0, not >= 0); 0.5 still works.
+            "pearson_delta": [-1.0, -0.9, -0.5, 0.0, 0.5],
+        }
+    )
+    out = _spearman_brown_correct(df)["pearson_delta"].to_list()
+    assert all(np.isnan(v) for v in out[:4]), out
+    assert out[4] == pytest.approx(2 / 3, abs=1e-6)  # r > 0 still corrected
+
+    # a null mean (metric produced no value) also falls through to NaN
+    null_df = pl.DataFrame(
+        {"perturbation": ["a"], "pearson_delta": [None]},
+        schema={"perturbation": pl.Utf8, "pearson_delta": pl.Float64},
+    )
+    assert np.isnan(_spearman_brown_correct(null_df)["pearson_delta"][0])
+
+
+def test_disjoint_halves_requires_two_cells_and_a_control():
+    """The split fails loudly rather than with a bare numpy/pipeline error when
+    nothing can be split, or when the control specifically cannot be."""
+    adata_real = build_random_anndata()
+
+    def _evaluator(adata):
+        return MetricsEvaluator(
+            adata_pred=adata.copy(),
+            adata_real=adata,
+            control_pert=CONTROL_VAR,
+            pert_col=PERT_COL,
+            outdir=OUTDIR,
+            skip_de=True,
+        )
+
+    # one cell per perturbation -> nothing is splittable
+    obs = adata_real.obs
+    first_of_each = [
+        int(np.flatnonzero((obs[PERT_COL].astype(str) == p).to_numpy())[0])
+        for p in obs[PERT_COL].astype(str).unique()
+    ]
+    with pytest.raises(ValueError, match="no perturbation has >= 2 cells"):
+        _evaluator(adata_real[first_of_each].copy())._disjoint_halves(seed=0)
+
+    # control has a single cell, other perturbations are fine
+    is_ctrl = (obs[PERT_COL].astype(str) == CONTROL_VAR).to_numpy()
+    keep = np.concatenate([np.flatnonzero(is_ctrl)[:1], np.flatnonzero(~is_ctrl)])
+    with pytest.raises(ValueError, match="cannot compute a disjoint-split"):
+        _evaluator(adata_real[np.sort(keep)].copy())._disjoint_halves(seed=0)
+
+    shutil.rmtree(OUTDIR, ignore_errors=True)
 
 
 def test_disjoint_halves_share_no_cells():
@@ -103,8 +161,14 @@ def test_compute_ceiling_end_to_end():
     # the ceiling is the SB-corrected aggregate (mean over perturbations) - one row
     assert agg.height == 1
     assert "pearson_delta" in agg.columns
-    cv = agg["pearson_delta"].to_numpy()
-    assert np.all(cv <= 1.0 + 1e-9)  # SB doubling can never exceed 1
+    # Two-sided: after the r > 0 guard an SB ceiling is either NaN (non-positive
+    # reliability, no defensible ceiling) or in (0, 1] - doubling an r in (0, 1] can
+    # neither exceed 1 nor come out negative. A one-sided `<= 1.0` would silently
+    # admit a blown-up pole value (r = -0.9 -> -18.0, r = -1 -> -inf).
+    for col in agg.columns:
+        if col in SB_METRICS:
+            v = agg[col].to_numpy()
+            assert np.all(np.isnan(v) | ((v > 0.0) & (v <= 1.0 + 1e-9))), col
 
     # error metrics and excluded reliabilities have no ceiling -> NaN in the aggregate
     for col in ("mse", "mae", "clustering_agreement", "pearson_edistance"):
