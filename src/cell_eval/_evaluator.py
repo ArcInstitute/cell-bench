@@ -140,6 +140,19 @@ class MetricsEvaluator:
         # compute_ceiling() may be called.
         self.ceiling_only = adata_pred is None
 
+        # Precomputed DE cannot be reused in ceiling-only mode: the main comparison
+        # is skipped, and the ceiling computes DE on its own disjoint halves. Warn
+        # (rather than fail) so a stray argument does not break an otherwise valid
+        # run, but the user is not left believing their table was used.
+        if self.ceiling_only:
+            for name, value in (("de_pred", de_pred), ("de_real", de_real)):
+                if value is not None:
+                    logger.warning(
+                        f"{name} is ignored in ceiling-only mode (adata_pred=None): "
+                        f"the ceiling computes differential expression on its own "
+                        f"disjoint halves of the real data."
+                    )
+
         self.anndata_pair = _build_anndata_pair(
             real=adata_real,
             pred=adata_pred,
@@ -432,6 +445,13 @@ def _build_anndata_pair(
 
     # Ceiling-only mode: no prediction supplied. The data ceiling reads only
     # `.real`, so mirror real into pred to satisfy the pair (it is never scored).
+    #
+    # INVARIANT: this aliases the SAME object - `pair.real is pair.pred`. It is not
+    # a copy, because copying a matrix that is never scored would double peak memory
+    # for nothing. Safe only because ceiling-only mode blocks `compute()` and
+    # `compute_ceiling()` derives fresh copies of both halves from `.real`. Anything
+    # that mutates `.pred` in place would therefore corrupt `.real`: take a copy
+    # first, or gate the write on `adata_pred is not None`.
     if pred is None:
         pred = real
     else:

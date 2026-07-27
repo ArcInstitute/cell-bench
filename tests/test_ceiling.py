@@ -175,3 +175,99 @@ def test_compute_ceiling_end_to_end():
         if col in agg.columns:
             assert np.all(np.isnan(agg[col].to_numpy()))
     shutil.rmtree(OUTDIR)
+
+
+def _ceiling_only_evaluator(adata_real, **kwargs):
+    return MetricsEvaluator(
+        adata_pred=None,
+        adata_real=adata_real,
+        control_pert=CONTROL_VAR,
+        pert_col=PERT_COL,
+        outdir=OUTDIR,
+        **kwargs,
+    )
+
+
+def test_ceiling_only_mode_shape():
+    """adata_pred=None is ceiling-only: the main DE comparison is skipped, the pair's
+    pred side is the real object itself (a placeholder that is never scored), and
+    compute() refuses rather than silently scoring real against itself."""
+    adata_real = build_random_anndata()
+    evaluator = _ceiling_only_evaluator(adata_real)
+
+    assert evaluator.ceiling_only
+    assert evaluator.de_comparison is None  # main comparison skipped
+    # documented invariant: the placeholder aliases real, it is not a copy
+    assert evaluator.anndata_pair.real is evaluator.anndata_pair.pred
+
+    with pytest.raises(ValueError, match="ceiling-only mode"):
+        evaluator.compute(profile="anndata", write_csv=False)
+
+    shutil.rmtree(OUTDIR, ignore_errors=True)
+
+
+def test_ceiling_only_matches_ceiling_with_a_prediction():
+    """The ceiling is a property of the real data alone, so supplying a prediction
+    must not change it: the same seed yields the same ceiling either way."""
+    adata_real = build_random_anndata()
+
+    with_pred = MetricsEvaluator(
+        adata_pred=adata_real.copy(),
+        adata_real=adata_real,
+        control_pert=CONTROL_VAR,
+        pert_col=PERT_COL,
+        outdir=OUTDIR,
+        skip_de=True,
+    )
+    _, agg_pred = with_pred.compute_ceiling(
+        profile="anndata", write_csv=False, break_on_error=True, seed=0
+    )
+
+    ceiling_only = _ceiling_only_evaluator(adata_real, skip_de=True)
+    _, agg_only = ceiling_only.compute_ceiling(
+        profile="anndata", write_csv=False, break_on_error=True, seed=0
+    )
+
+    assert agg_only.columns == agg_pred.columns
+    for col in agg_pred.columns:
+        a, b = agg_pred[col].to_numpy(), agg_only[col].to_numpy()
+        assert np.all(np.isnan(a) == np.isnan(b)), col
+        mask = ~np.isnan(a)
+        assert np.allclose(a[mask], b[mask], rtol=1e-12, atol=0.0), col
+
+    shutil.rmtree(OUTDIR, ignore_errors=True)
+
+
+def test_cli_rejects_missing_prediction_without_ceiling():
+    """Omitting --adata-pred without --ceiling leaves nothing to compute. That is a
+    usage error, so it exits 2 with a message rather than raising a traceback."""
+    import argparse
+
+    from cell_eval._cli._run import run_evaluation
+
+    args = argparse.Namespace(
+        adata_pred=None,
+        ceiling=False,
+        embed_key=None,
+        skip_metrics=None,
+        num_threads=1,
+    )
+    with pytest.raises(SystemExit) as exc:
+        run_evaluation(args)
+    assert exc.value.code == 2
+
+
+def test_ceiling_only_warns_that_precomputed_de_is_unused(caplog):
+    """Precomputed DE cannot be reused in ceiling-only mode (the ceiling runs DE on
+    its own halves), so it warns for both sides rather than failing or going quiet."""
+    adata_real = build_random_anndata()
+    de = pl.DataFrame({"target": ["a"], "feature": ["g"], "p_value": [0.5]})
+
+    with caplog.at_level("WARNING"):
+        _ceiling_only_evaluator(adata_real, de_pred=de, de_real=de, skip_de=True)
+
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert any("de_pred is ignored in ceiling-only mode" in m for m in warnings)
+    assert any("de_real is ignored in ceiling-only mode" in m for m in warnings)
+
+    shutil.rmtree(OUTDIR, ignore_errors=True)

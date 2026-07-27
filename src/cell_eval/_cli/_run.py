@@ -2,6 +2,7 @@ import argparse as ap
 import importlib.metadata
 import logging
 import os
+import sys
 from typing import Any
 
 from .. import KNOWN_PROFILES
@@ -19,8 +20,9 @@ def parse_args_run(parser: ap.ArgumentParser):
         "--adata-pred",
         type=str,
         help="Path to the predicted adata object to evaluate. Optional in "
-        "ceiling-only mode (omit together with --ceiling to compute just the "
-        "real-data ceiling without a prediction).",
+        "ceiling-only mode (omit when passing --ceiling to compute just the "
+        "real-data ceiling without a prediction). In that mode only the ceiling "
+        "outputs are written - no results.csv and no DE tables.",
         required=False,
     )
     parser.add_argument(
@@ -173,9 +175,14 @@ def run_evaluation(args: ap.Namespace):
     # can be computed. Requires --ceiling to make the intent explicit.
     ceiling_only = args.adata_pred is None
     if ceiling_only and not args.ceiling:
-        raise ValueError(
-            "--adata-pred is required unless --ceiling is passed (ceiling-only mode)."
+        # Usage error, so exit like argparse would (message on stderr, status 2)
+        # rather than surfacing a traceback for a wrong invocation.
+        print(
+            "cell-eval run: error: --adata-pred is required unless --ceiling is "
+            "passed (ceiling-only mode)",
+            file=sys.stderr,
         )
+        sys.exit(2)
 
     # DE knobs forwarded to pdex (cpm_filter off by default; epsilon default 0.0).
     pdex_kwargs: dict[str, Any] = {
