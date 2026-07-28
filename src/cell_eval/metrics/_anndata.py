@@ -149,7 +149,8 @@ def discrimination_score(
         # Ignore the embedding key for L1
         embed_key = None
 
-    # Compute perturbation effects for all perturbations
+    # Compute perturbation effects for all perturbations. The underlying
+    # pseudobulk is memoized on the pair, so this is shared across metrics.
     real_effects = np.vstack(
         [
             d.perturbation_effect(which="real", abs=False)
@@ -163,39 +164,170 @@ def discrimination_score(
         ]
     )
 
-    norm_ranks = {}
-    for p_idx, p in enumerate(data.perts):
-        # Determine which features to include in the comparison
-        if exclude_target_gene and not embed_key:
-            # For expression data, exclude the target gene
-            include_mask = np.flatnonzero(data.genes != p)
-        else:
-            # For embedding data or when not excluding target gene, use all features
-            include_mask = np.ones(real_effects.shape[1], dtype=bool)
+    # dist_matrix[i, j] = distance(pred_effect[i], real_effect[j]); each row is
+    # the vector of distances from one predicted effect to all real effects.
+    #
+    # When excluding the target gene on expression data, perturbation i drops a
+    # *different* feature column (the gene named like perturbation i), so a
+    # single unmasked pairwise call would not reproduce the per-perturbation
+    # masked distances. We instead compute the full matrix once and apply an
+    # exact, vectorized rank-1 correction that removes the target gene's
+    # contribution from each row. For metrics without a closed-form column
+    # correction we fall back to exact per-row masked distances.
+    do_exclude = exclude_target_gene and not embed_key
+    family = _distance_family(metric)
 
-        # Compute distances to all real effects
-        distances = skm.pairwise_distances(
-            real_effects[
-                :, include_mask
-            ],  # compare to all real effects across perturbations
-            pred_effects[p_idx, include_mask].reshape(
-                1, -1
-            ),  # select pred effect for current perturbation
-            metric=metric,
+    if not do_exclude:
+        dist_matrix = skm.pairwise_distances(pred_effects, real_effects, metric=metric)
+    elif family is None:
+        dist_matrix = _masked_distance_matrix(
+            real_effects, pred_effects, data.genes, data.perts, metric
+        )
+    else:
+        # `family` is narrowed to Literal["l1", "l2", "cosine"] here.
+        dist_matrix = _excluded_distance_matrix(
+            real_effects,
+            pred_effects,
+            data.genes,
+            data.perts,
+            family,
+        )
+
+    # Rank of the matching perturbation within each row, by ascending distance.
+    # order[i] lists columns by increasing distance, so the rank of perturbation
+    # i is the position of column i within row i. A boolean match locates that
+    # position directly -- equivalent to argsort(argsort(.)) but without a
+    # second full-matrix sort (cheaper, and the mask is bool rather than int).
+    n_pert = data.perts.size
+    order = np.argsort(dist_matrix, axis=1)
+    ranks = np.where(order == np.arange(n_pert)[:, None])[1]
+
+    return {str(p): float(1 - ranks[i] / n_pert) for i, p in enumerate(data.perts)}
+
+
+def _distance_family(metric: str) -> Literal["l1", "l2", "cosine"] | None:
+    """Map a pairwise metric name onto a family with a closed-form column drop."""
+    match metric.lower():
+        case "l1" | "manhattan" | "cityblock":
+            return "l1"
+        case "l2" | "euclidean":
+            return "l2"
+        case "cosine":
+            return "cosine"
+        case _:
+            return None
+
+
+def _target_gene_columns(genes: np.ndarray, perts: np.ndarray) -> list[list[int]]:
+    """Feature columns whose gene name matches each perturbation (usually 0 or 1)."""
+    gene_to_cols: dict[str, list[int]] = {}
+    for col, g in enumerate(genes):
+        gene_to_cols.setdefault(str(g), []).append(col)
+    return [gene_to_cols.get(str(p), []) for p in perts]
+
+
+def _masked_row(
+    real_effects: np.ndarray,
+    pred_row: np.ndarray,
+    excluded_cols: Sequence[int],
+    metric: str,
+) -> np.ndarray:
+    """Distances from one predicted effect to all real effects, dropping columns."""
+    if excluded_cols:
+        mask = np.ones(real_effects.shape[1], dtype=bool)
+        mask[list(excluded_cols)] = False
+        return skm.pairwise_distances(
+            real_effects[:, mask], pred_row[mask].reshape(1, -1), metric=metric
         ).flatten()
+    return skm.pairwise_distances(
+        real_effects, pred_row.reshape(1, -1), metric=metric
+    ).flatten()
 
-        # Sort by distance (ascending - lower distance = better match)
-        sorted_indices = np.argsort(distances)
 
-        # Find rank of the correct perturbation
-        p_index = np.flatnonzero(data.perts == p)[0]
-        rank = np.flatnonzero(sorted_indices == p_index)[0]
+def _masked_distance_matrix(
+    real_effects: np.ndarray,
+    pred_effects: np.ndarray,
+    genes: np.ndarray,
+    perts: np.ndarray,
+    metric: str,
+) -> np.ndarray:
+    """Per-row masked distance matrix for metrics without a column correction."""
+    excluded = _target_gene_columns(genes, perts)
+    return np.vstack(
+        [
+            _masked_row(real_effects, pred_effects[i], excluded[i], metric)
+            for i in range(perts.size)
+        ]
+    )
 
-        # Normalize rank by total number of perturbations
-        norm_rank = rank / data.perts.size
-        norm_ranks[str(p)] = 1 - norm_rank
 
-    return norm_ranks
+def _excluded_distance_matrix(
+    real_effects: np.ndarray,
+    pred_effects: np.ndarray,
+    genes: np.ndarray,
+    perts: np.ndarray,
+    family: Literal["l1", "l2", "cosine"],
+) -> np.ndarray:
+    """Full distance matrix with each row's target gene contribution removed.
+
+    Row i corresponds to perturbation i; the feature column named like
+    perturbation i is dropped from that row's distances only. The result is
+    numerically equivalent (up to floating-point summation order) to computing
+    `pairwise_distances` on the masked columns per perturbation.
+    """
+    n_pert = perts.size
+    excluded = _target_gene_columns(genes, perts)
+
+    has_target = np.zeros(n_pert, dtype=bool)
+    tcol = np.zeros(n_pert, dtype=np.intp)
+    multi: list[int] = []
+    for i, cols in enumerate(excluded):
+        if len(cols) == 1:
+            has_target[i] = True
+            tcol[i] = cols[0]
+        elif len(cols) > 1:
+            multi.append(i)
+
+    rows = np.arange(n_pert)
+    mask2d = has_target[:, None]
+    # pred_at[i]    = pred_effects[i, tcol[i]]
+    # real_at[i, j] = real_effects[j, tcol[i]]
+    pred_at = pred_effects[rows, tcol]
+    real_at = real_effects[:, tcol].T
+
+    match family:
+        case "l1":
+            out = skm.pairwise_distances(pred_effects, real_effects, metric="l1")
+            out -= np.where(mask2d, np.abs(pred_at[:, None] - real_at), 0.0)
+        case "l2":
+            out = skm.pairwise_distances(pred_effects, real_effects, metric="l2")
+            corr = np.where(mask2d, (pred_at[:, None] - real_at) ** 2, 0.0)
+            out = np.sqrt(np.maximum(out**2 - corr, 0.0))
+        case _:  # cosine: drop the column from the dot product and both norms
+            dot = pred_effects @ real_effects.T
+            pred_sq = np.einsum("ij,ij->i", pred_effects, pred_effects)
+            real_sq = np.einsum("ij,ij->i", real_effects, real_effects)
+            dot -= np.where(mask2d, pred_at[:, None] * real_at, 0.0)
+            pred_sq_m = pred_sq - np.where(has_target, pred_at**2, 0.0)
+            real_sq_m = real_sq[None, :] - np.where(mask2d, real_at**2, 0.0)
+            # An effect dominated by its target gene can leave a masked squared
+            # norm at a tiny negative value from float rounding; clip to 0 so the
+            # norm is real (not NaN). The resulting zero norm is then handled
+            # like sklearn below (cosine similarity 0 -> distance 1).
+            denom = np.sqrt(np.maximum(pred_sq_m, 0.0))[:, None] * np.sqrt(
+                np.maximum(real_sq_m, 0.0)
+            )
+            with np.errstate(divide="ignore", invalid="ignore"):
+                cos = dot / denom
+            cos = np.where(denom == 0.0, 0.0, cos)
+            out = np.clip(1 - cos, 0.0, 2.0)
+
+    # Safety net for the rare case of duplicate gene names matching a single
+    # perturbation (more than one column to drop): recompute those rows exactly.
+    for i in multi:
+        out[i] = _masked_row(real_effects, pred_effects[i], excluded[i], family)
+
+    return out
 
 
 def _generic_evaluation(

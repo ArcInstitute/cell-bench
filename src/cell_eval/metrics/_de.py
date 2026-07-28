@@ -191,18 +191,36 @@ class DENsigCounts:
 
     def __call__(self, data: DEComparison) -> dict[str, dict[str, int]]:
         """Compute counts of significant genes in real and predicted DE."""
-        counts = {}
+        # One grouped count per side instead of a per-pert full-table scan; only
+        # the count (the old per-pert get_significant_genes(...).size) is used.
+        real_counts = {
+            str(pert): count
+            for pert, count in data.real.filter_to_significant(
+                fdr_threshold=self.fdr_threshold
+            )
+            .group_by(data.real.target_col)
+            .len()
+            .iter_rows()
+        }
+        pred_counts = {
+            str(pert): count
+            for pert, count in data.pred.filter_to_significant(
+                fdr_threshold=self.fdr_threshold
+            )
+            .group_by(data.pred.target_col)
+            .len()
+            .iter_rows()
+        }
 
-        for pert in data.iter_perturbations():
-            real_sig = data.real.get_significant_genes(pert, self.fdr_threshold)
-            pred_sig = data.pred.get_significant_genes(pert, self.fdr_threshold)
-
-            counts[pert] = {
-                "real": int(real_sig.size),
-                "pred": int(pred_sig.size),
+        # Reindex over the full perturbation universe so perts with no
+        # significant genes on a side stay at 0 (matching the old empty .size).
+        return {
+            pert: {
+                "real": int(real_counts.get(str(pert), 0)),
+                "pred": int(pred_counts.get(str(pert), 0)),
             }
-
-        return counts
+            for pert in data.iter_perturbations()
+        }
 
 
 def compute_pr_auc(data: DEComparison) -> dict[str, float]:
@@ -245,10 +263,22 @@ def compute_generic_auc(
         )
     )
 
+    # Slice the table once instead of a full .filter(target == pert) scan per
+    # perturbation. maintain_order keeps each partition in the same row order the
+    # per-pert filter produced, so labels/scores -> sklearn stay bit-identical.
+    # partition_by(as_dict=True) keys are tuples on newer polars, scalars on
+    # older; normalize both to str so lookup by perturbation name is stable.
+    partitions = {
+        str(key[0] if isinstance(key, tuple) else key): frame
+        for key, frame in merged.partition_by(
+            target_col, as_dict=True, maintain_order=True
+        ).items()
+    }
+
     results: dict[str, float] = {}
     for pert in data.iter_perturbations():
-        pert_data = merged.filter(pl.col(target_col) == pert)
-        if pert_data.shape[0] == 0:
+        pert_data = partitions.get(str(pert))
+        if pert_data is None or pert_data.shape[0] == 0:
             results[pert] = float("nan")
             continue
 

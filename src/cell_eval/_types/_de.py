@@ -51,6 +51,12 @@ class DEResults:
     fdr_col: str = "fdr"
     name: str = "de"
 
+    # Caches the (sort_by, fdr_threshold) -> rank-matrix pivot built by
+    # get_top_genes; excluded from init/repr/eq so it never affects identity.
+    _top_genes_cache: dict[tuple[DESortBy, float], pl.DataFrame] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
     def __post_init__(self) -> None:
         required_cols = {
             self.target_col,
@@ -150,6 +156,16 @@ class DEResults:
         # Set FDR threshold if not provided
         fdr_threshold = fdr_threshold if fdr_threshold is not None else 0.05
 
+        # The rank matrix depends only on (sort_by, fdr_threshold). The overlap
+        # family registers many variants (overlap/precision x several k) that all
+        # request this same matrix -- k only truncates the per-pert gene lists in
+        # compute_overlap, never the pivot -- so memoize it to rebuild the wide
+        # one-column-per-perturbation pivot once instead of once per variant.
+        cache_key = (sort_by, fdr_threshold)
+        cached = self._top_genes_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         descending = sort_by in {
             DESortBy.LOG2_FOLD_CHANGE,
             DESortBy.ABS_LOG2_FOLD_CHANGE,
@@ -180,6 +196,7 @@ class DEResults:
                 [pl.lit(None).alias(p) for p in missing_perts]
             )
 
+        self._top_genes_cache[cache_key] = rank_matrix
         return rank_matrix
 
 
@@ -244,13 +261,16 @@ class DEComparison:
             # Cannot evaluate in this case so setting all perturbations to 0.0
             return {pert: 0.0 for pert in self.iter_perturbations()}
 
+        # `.columns` rebuilds a fresh list on every access; hoist both into sets
+        # once so the per-pert membership test is O(1) rather than O(n_perts),
+        # which over the loop is the difference between O(n_perts) and O(n_perts^2).
+        real_cols = set(real_sig_rank_matrix.columns)
+        pred_cols = set(pred_sig_rank_matrix.columns)
+
         overlaps = {}
         for pert in self.iter_perturbations():
             # If perturbation is not in either real or pred, set overlap to 0.0
-            if (
-                pert not in real_sig_rank_matrix.columns
-                or pert not in pred_sig_rank_matrix.columns
-            ):
+            if pert not in real_cols or pert not in pred_cols:
                 overlaps[pert] = 0.0
                 continue
 
