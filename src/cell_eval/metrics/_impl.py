@@ -8,6 +8,7 @@ from ._anndata import (
     mse,
     mse_delta,
     pearson_delta,
+    top_k_accuracy,
 )
 from ._de import (
     DEDirectionMatch,
@@ -71,6 +72,14 @@ for distance_metric in ["l1", "l2", "cosine"]:
         func=discrimination_score,
         kwargs={"metric": distance_metric},
     )
+
+metrics_registry.register(
+    name="top_k_accuracy",
+    metric_type=MetricType.ANNDATA_PAIR,
+    description="Top-k retrieval accuracy of predicted perturbation profiles",
+    best_value=MetricBestValue.ONE,
+    func=top_k_accuracy,
+)
 
 metrics_registry.register(
     name="pearson_edistance",

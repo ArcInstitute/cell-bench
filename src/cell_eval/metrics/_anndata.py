@@ -198,6 +198,88 @@ def discrimination_score(
     return norm_ranks
 
 
+def _get_array(
+    adata: ad.AnnData,
+    embed_key: str | None = None,
+) -> np.ndarray:
+    """Extract a dense numpy array from an AnnData object."""
+
+    matrix = adata.obsm[embed_key] if embed_key else adata.X
+    if issparse(matrix):
+        matrix = matrix.toarray()  # type: ignore[assignment]
+    if matrix.dtype != np.float64:
+        matrix = matrix.astype(np.float64, copy=False)  # type: ignore[assignment]
+    return matrix  # type: ignore[return-value]
+
+
+def top_k_accuracy(
+    data: PerturbationAnndataPair,
+    k: int = 5,
+    metric: str = "l2",
+    embed_key: str | None = None,
+) -> dict[str, float]:
+    """Compute top-k accuracy for perturbation retrieval.
+
+    For each real perturbed cell, we identify the *k* closest predicted cells (according
+    to the provided distance metric) and assign a score of ``1`` if any of those cells
+    share the same perturbation label. Otherwise we assign ``0``. The score for each
+    perturbation is the mean score across its constituent cells.
+
+    Args:
+        data: Paired AnnData objects containing real and predicted perturbations.
+        k: Number of nearest neighbours to consider.
+        metric: Distance metric to use when computing neighbours. Defaults to ``"l2"``.
+        embed_key: Optional embedding key in ``obsm`` to use instead of expression.
+
+    Returns:
+        Mapping from perturbation name to top-k accuracy.
+    """
+
+    if k <= 0:
+        raise ValueError("Parameter `k` must be a positive integer")
+
+    metric_normalized = metric.lower()
+    if metric_normalized in {"l2", "euclidean"}:
+        metric_normalized = "euclidean"
+    elif metric_normalized in {"l1", "manhattan", "cityblock"}:
+        metric_normalized = "manhattan"
+
+    real_matrix = _get_array(data.real, embed_key=embed_key)
+    pred_matrix = _get_array(data.pred, embed_key=embed_key)
+    pred_labels = data.pred.obs[data.pert_col].to_numpy(str)
+
+    n_pred_cells = pred_matrix.shape[0]
+    if n_pred_cells == 0:
+        raise ValueError("Predicted AnnData does not contain any cells")
+
+    topk = min(k, n_pred_cells)
+
+    scores: dict[str, float] = {}
+    for pert in data.perts:
+        real_indices = data.pert_mask_real[pert]
+        if real_indices.size == 0:
+            scores[str(pert)] = float("nan")
+            continue
+
+        real_cells = real_matrix[real_indices]
+        cell_scores = np.zeros(real_cells.shape[0], dtype=np.float64)
+
+        distances = skm.pairwise_distances(
+            real_cells,
+            pred_matrix,
+            metric=metric_normalized,
+        )
+
+        for idx, neighbor_distances in enumerate(distances):
+            neighbor_indices = np.argpartition(neighbor_distances, topk - 1)[:topk]
+            neighbor_perts = pred_labels[neighbor_indices]
+            cell_scores[idx] = float(np.any(neighbor_perts == pert))
+
+        scores[str(pert)] = float(cell_scores.mean())
+
+    return scores
+
+
 def _generic_evaluation(
     data: PerturbationAnndataPair,
     func: Callable[[np.ndarray, np.ndarray], float],

@@ -8,6 +8,7 @@ from ._anndata import (
     mse,
     mse_delta,
     pearson_delta,
+    top_k_accuracy,
 )
 from ._de import (
     DEDirectionMatch,
@@ -31,6 +32,7 @@ __all__ = [
     "mse_delta",
     "mae_delta",
     "discrimination_score",
+    "top_k_accuracy",
     # DE metrics
     "DEDirectionMatch",
     "DESpearmanSignificant",
